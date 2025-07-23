@@ -101,8 +101,10 @@ type ClientManagerInterface interface {
 }
 
 type ResourceManagerOptions struct {
-	CollectMetrics bool `json:"collect_metrics,omitempty"`
-	CacheDisabled  bool `json:"cache_disabled,omitempty"`
+	CollectMetrics       bool                              `json:"collect_metrics,omitempty"`
+	CacheDisabled        bool                              `json:"cache_disabled,omitempty"`
+	DefaultWorkspace     *corev1.PersistentVolumeClaimSpec `json:"default_workspace,omitempty"`
+	DefaultWorkspaceSize string                            `json:"default_workspace_size,omitempty"`
 }
 
 type ResourceManager struct {
@@ -298,20 +300,46 @@ func (r *ResourceManager) GetPipelineByNameAndNamespaceV1(name string, namespace
 }
 
 // Deletes a pipeline. Does not delete pipeline spec in the object storage.
-// Fails if the pipeline has existing pipeline versions.
-func (r *ResourceManager) DeletePipeline(pipelineId string) error {
+// If cascade is false, fails if the pipeline has existing pipeline versions.
+// If cascade is true, deletes all pipeline versions first, then deletes the pipeline.
+func (r *ResourceManager) DeletePipeline(pipelineId string, cascade bool) error {
 	// Check if pipeline exists
 	_, err := r.pipelineStore.GetPipeline(pipelineId)
 	if err != nil {
 		return util.Wrapf(err, "Failed to delete pipeline with id %v as it was not found", pipelineId)
 	}
 
-	// Check if it has no pipeline versions in Ready state
-	latestPipelineVersion, err := r.pipelineStore.GetLatestPipelineVersion(pipelineId)
-	if latestPipelineVersion != nil {
-		return util.NewInvalidInputError("Failed to delete pipeline with id %v as it has existing pipeline versions (e.g. %v)", pipelineId, latestPipelineVersion.UUID)
-	} else if err.(*util.UserError).ExternalStatusCode() != codes.NotFound {
-		return util.Wrapf(err, "Failed to delete pipeline with id %v as it failed to check existing pipeline versions", pipelineId)
+	if cascade {
+		// Get all pipeline versions for this pipeline and delete them
+		opts := list.EmptyOptions()
+		pipelineVersions, _, _, err := r.pipelineStore.ListPipelineVersions(pipelineId, opts)
+		if err != nil {
+			return util.Wrapf(err, "Failed to delete pipeline with id %v due to error listing pipeline versions", pipelineId)
+		}
+
+		// Delete each pipeline version
+		for _, pipelineVersion := range pipelineVersions {
+			// Mark pipeline version as deleting so it's not visible to user.
+			err = r.pipelineStore.UpdatePipelineVersionStatus(pipelineVersion.UUID, model.PipelineVersionDeleting)
+			if err != nil {
+				return util.Wrapf(err, "Failed to change the status of pipeline version id %v to DELETING during cascade delete", pipelineVersion.UUID)
+			}
+
+			// Delete the pipeline version from the database
+			err = r.pipelineStore.DeletePipelineVersion(pipelineVersion.UUID)
+			if err != nil {
+				return util.Wrapf(err, "Failed to delete pipeline version %v during cascade delete of pipeline %v", pipelineVersion.UUID, pipelineId)
+			}
+			glog.Infof("Successfully deleted pipeline version %v during cascade delete of pipeline %v", pipelineVersion.UUID, pipelineId)
+		}
+	} else {
+		// Check if it has no pipeline versions in Ready state
+		latestPipelineVersion, err := r.pipelineStore.GetLatestPipelineVersion(pipelineId)
+		if latestPipelineVersion != nil {
+			return util.NewInvalidInputError("Failed to delete pipeline with id %v as it has existing pipeline versions (e.g. %v). Set cascade=true to delete all versions", pipelineId, latestPipelineVersion.UUID)
+		} else if err.(*util.UserError).ExternalStatusCode() != codes.NotFound {
+			return util.Wrapf(err, "Failed to delete pipeline with id %v as it failed to check existing pipeline versions", pipelineId)
+		}
 	}
 
 	// Mark pipeline as deleting so it's not visible to user.
@@ -375,7 +403,7 @@ func (r *ResourceManager) CreatePipelineAndPipelineVersion(p *model.Pipeline, pv
 	if pipelineSpecURI != "" {
 		pv.PipelineSpecURI = pipelineSpecURI
 	}
-	tmpl, err := template.New(pipelineSpecBytes, r.options.CacheDisabled)
+	tmpl, err := template.New(pipelineSpecBytes, r.options.CacheDisabled, r.options.DefaultWorkspace)
 	if err != nil {
 		return nil, nil, util.Wrap(err, "Failed to create a pipeline and a pipeline version due to template creation error")
 	}
@@ -508,9 +536,10 @@ func (r *ResourceManager) CreateRun(ctx context.Context, run *model.Run) (*model
 	}
 	run.RunDetails.CreatedAtInSec = r.time.Now().Unix()
 	runWorkflowOptions := template.RunWorkflowOptions{
-		RunId:         run.UUID,
-		RunAt:         run.RunDetails.CreatedAtInSec,
-		CacheDisabled: r.options.CacheDisabled,
+		RunId:            run.UUID,
+		RunAt:            run.CreatedAtInSec,
+		CacheDisabled:    r.options.CacheDisabled,
+		DefaultWorkspace: r.options.DefaultWorkspace,
 	}
 	executionSpec, err := tmpl.RunWorkflow(run, runWorkflowOptions)
 	if err != nil {
@@ -1107,7 +1136,7 @@ func (r *ResourceManager) CreateJob(ctx context.Context, job *model.Job) (*model
 			return nil, util.Wrap(err, "Failed to validate the input parameters on the latest pipeline version")
 		}
 
-		tmpl, err := template.New(manifest, r.options.CacheDisabled)
+		tmpl, err := template.New(manifest, r.options.CacheDisabled, r.options.DefaultWorkspace)
 		if err != nil {
 			return nil, util.Wrap(err, "Failed to fetch a template with an invalid pipeline spec manifest")
 		}
@@ -1493,7 +1522,7 @@ func (r *ResourceManager) fetchTemplateFromPipelineSpec(pipelineSpec *model.Pipe
 			return nil, "", util.NewInvalidInputError("Failed to fetch a template with an empty pipeline spec manifest")
 		}
 	}
-	tmpl, err := template.New([]byte(manifest), r.options.CacheDisabled)
+	tmpl, err := template.New([]byte(manifest), r.options.CacheDisabled, r.options.DefaultWorkspace)
 	if err != nil {
 		return nil, "", util.Wrap(err, "Failed to fetch a template with an invalid pipeline spec manifest")
 	}
@@ -1652,7 +1681,7 @@ func (r *ResourceManager) CreatePipelineVersion(pv *model.PipelineVersion) (*mod
 	}
 
 	// Create a template
-	tmpl, err := template.New(pipelineSpecBytes, r.options.CacheDisabled)
+	tmpl, err := template.New(pipelineSpecBytes, r.options.CacheDisabled, r.options.DefaultWorkspace)
 	if err != nil {
 		return nil, util.Wrap(err, "Failed to create a pipeline version due to template creation error")
 	}
